@@ -1,3 +1,0 @@
-chmod +x setup.sh start.sh
-./setup.sh
-./start.sh

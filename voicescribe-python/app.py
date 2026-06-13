@@ -3,28 +3,42 @@ VoiceScribe — Audio to Text
 Uses OpenAI Whisper (local model, no API key needed) via the `faster-whisper` library.
 """
 
+import logging
 import os
-import sys
-import time
-import threading
 import tempfile
-import shutil
+import threading
+import time
 from pathlib import Path
 
+# Keep runtime activity local unless the operator explicitly enables sharing.
+os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
+
+import ctranslate2
 import gradio as gr
-import torch
 from faster_whisper import WhisperModel
 
-# ─── Model cache ────────────────────────────────────────────────────────────
-_model_cache: dict = {}
+logging.basicConfig(
+    level=os.getenv("VOICESCRIBE_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("voicescribe")
+
+# Keep one model resident at a time to avoid exhausting memory when users switch sizes.
+_model_lock = threading.Lock()
+_model_key: tuple[str, str, str] | None = None
+_model: WhisperModel | None = None
 
 def get_model(model_size: str, device: str, compute_type: str) -> WhisperModel:
+    global _model_key, _model
+
     key = (model_size, device, compute_type)
-    if key not in _model_cache:
-        print(f"[VoiceScribe] Loading model '{model_size}' on {device} ({compute_type})…")
-        _model_cache[key] = WhisperModel(model_size, device=device, compute_type=compute_type)
-        print("[VoiceScribe] Model ready.")
-    return _model_cache[key]
+    with _model_lock:
+        if key != _model_key or _model is None:
+            logger.info("Loading model '%s' on %s (%s)", model_size, device, compute_type)
+            _model = WhisperModel(model_size, device=device, compute_type=compute_type)
+            _model_key = key
+            logger.info("Model ready")
+        return _model
 
 # ─── Transcription core ─────────────────────────────────────────────────────
 def transcribe(
@@ -39,7 +53,7 @@ def transcribe(
     if not audio_path:
         return "", "⚠️ No audio provided."
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
     compute_type = "float16" if device == "cuda" else "int8"
 
     progress(0, desc="Loading model…")
@@ -148,7 +162,7 @@ def save_transcript(text: str, fmt: str) -> str | None:
 
 
 # ─── Gradio UI ──────────────────────────────────────────────────────────────
-def build_ui():
+def build_ui() -> tuple[gr.Blocks, str]:
     ACCENT  = "#00E5C5"
     BG      = "#0B0D13"
     SURFACE = "#13161F"
@@ -157,8 +171,6 @@ def build_ui():
     MUTED   = "#636B82"
 
     custom_css = f"""
-    @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500&display=swap');
-
     :root {{
         --accent:  {ACCENT};
         --bg:      {BG};
@@ -173,7 +185,7 @@ def build_ui():
     body, .gradio-container {{
         background: var(--bg) !important;
         color: var(--text) !important;
-        font-family: 'DM Sans', sans-serif !important;
+        font-family: system-ui, sans-serif !important;
     }}
 
     /* header */
@@ -183,7 +195,7 @@ def build_ui():
     }}
 
     #vs-header h1 {{
-        font-family: 'Syne', sans-serif;
+        font-family: system-ui, sans-serif;
         font-weight: 800;
         font-size: 2.8rem;
         letter-spacing: -0.04em;
@@ -213,7 +225,7 @@ def build_ui():
 
     /* labels */
     label span, .gr-block label {{
-        font-family: 'DM Mono', monospace !important;
+        font-family: ui-monospace, monospace !important;
         font-size: 0.72rem !important;
         text-transform: uppercase !important;
         letter-spacing: 0.08em !important;
@@ -226,7 +238,7 @@ def build_ui():
         border: 1px solid var(--border) !important;
         border-radius: 8px !important;
         color: var(--text) !important;
-        font-family: 'DM Sans', sans-serif !important;
+        font-family: system-ui, sans-serif !important;
     }}
 
     select:focus, input:focus, textarea:focus {{
@@ -239,7 +251,7 @@ def build_ui():
     button.primary, .gr-button-primary {{
         background: var(--accent) !important;
         color: #080A10 !important;
-        font-family: 'Syne', sans-serif !important;
+        font-family: system-ui, sans-serif !important;
         font-weight: 700 !important;
         font-size: 0.95rem !important;
         letter-spacing: 0.02em !important;
@@ -259,7 +271,7 @@ def build_ui():
         border: 1px solid var(--border) !important;
         color: var(--muted) !important;
         border-radius: 10px !important;
-        font-family: 'DM Sans', sans-serif !important;
+        font-family: system-ui, sans-serif !important;
         transition: border-color 0.15s, color 0.15s !important;
     }}
 
@@ -270,7 +282,7 @@ def build_ui():
 
     /* transcript output */
     #transcript-out textarea {{
-        font-family: 'DM Mono', monospace !important;
+        font-family: ui-monospace, monospace !important;
         font-size: 0.88rem !important;
         line-height: 1.8 !important;
         background: var(--bg) !important;
@@ -303,7 +315,7 @@ def build_ui():
 
     /* tab nav */
     .tab-nav button {{
-        font-family: 'DM Mono', monospace !important;
+        font-family: ui-monospace, monospace !important;
         font-size: 0.78rem !important;
         text-transform: uppercase !important;
         letter-spacing: 0.06em !important;
@@ -321,7 +333,7 @@ def build_ui():
     ::-webkit-scrollbar-thumb:hover {{ background: var(--muted); }}
     """
 
-    with gr.Blocks(title="VoiceScribe", css=custom_css) as demo:
+    with gr.Blocks(title="VoiceScribe") as demo:
 
         gr.HTML("""
         <div id="vs-header">
@@ -412,15 +424,21 @@ def build_ui():
             """Return whichever source has content."""
             if audio:
                 return audio
-            if filepath and Path(filepath).exists():
-                return filepath
+            if filepath:
+                path = Path(filepath).expanduser()
+                if path.is_file():
+                    return str(path.resolve())
             return None
 
         def run(audio, filepath, model, lang, task, fmt, wts, progress=gr.Progress(track_tqdm=True)):
             path = get_audio_path(audio, filepath)
             if not path:
                 return "", "⚠️ Please record, upload, or enter a file path."
-            return transcribe(path, model, lang, task, fmt, wts, progress)
+            try:
+                return transcribe(path, model, lang, task, fmt, wts, progress)
+            except Exception:
+                logger.exception("Transcription failed")
+                return "", "⚠️ Transcription failed. Check the server logs for details."
 
         transcribe_btn.click(
             fn=run,
@@ -446,16 +464,17 @@ def build_ui():
             outputs=[transcript_out, info_out, audio_input, file_path_input],
         )
 
-    return demo
+    return demo, custom_css
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    demo = build_ui()
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=False,
-        show_error=True,
-        inbrowser=True,
+    demo, custom_css = build_ui()
+    demo.queue(default_concurrency_limit=1).launch(
+        server_name=os.getenv("VOICESCRIBE_HOST", "127.0.0.1"),
+        server_port=int(os.getenv("VOICESCRIBE_PORT", "7860")),
+        share=os.getenv("VOICESCRIBE_SHARE", "false").lower() == "true",
+        show_error=os.getenv("VOICESCRIBE_SHOW_ERROR", "false").lower() == "true",
+        inbrowser=os.getenv("VOICESCRIBE_INBROWSER", "true").lower() == "true",
+        css=custom_css,
     )
